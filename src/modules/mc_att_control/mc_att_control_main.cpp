@@ -90,6 +90,8 @@
 #include <lib/mathlib/mathlib.h>
 #include <lib/geo/geo.h>
 #include <lib/tailsitter_recovery/tailsitter_recovery.h>
+#include "heli_ctrl/heli_ctrl_ert_rtw/heli_ctrl.h"
+#include "heli_ctrl/heli_ctrl_ert_rtw/heli_ctrl.c"
 
 /**
  * Multicopter attitude control app start / stop handling function
@@ -270,6 +272,11 @@ private:
 	void		control_attitude(float dt);
 
 	/**
+	 * Attitude controller.
+	 */
+	void		control_attitude_orig(float dt);
+
+	/**
 	 * Attitude rates controller.
 	 */
 	void		control_attitude_rates(float dt);
@@ -407,6 +414,10 @@ MulticopterAttitudeControl::MulticopterAttitudeControl() :
 	if (_params.vtol_type == 0 && _params.vtol_opt_recovery_enabled) {
 		// the vehicle is a tailsitter, use optimal recovery control strategy
 		_ts_opt_recovery = new TailsitterRecovery();
+		warnx("[tailsitterrecovery] ON! :-(");
+
+	} else {
+		warnx("[tailsitterrecovery] OFF! :-)");
 	}
 
 
@@ -432,6 +443,7 @@ MulticopterAttitudeControl::~MulticopterAttitudeControl()
 			}
 		} while (_control_task != -1);
 	}
+
 	if (_ts_opt_recovery != nullptr) {
 		delete _ts_opt_recovery;
 	}
@@ -650,6 +662,67 @@ MulticopterAttitudeControl::control_attitude(float dt)
 {
 	vehicle_attitude_setpoint_poll();
 
+	/* current Euler angles / quaternion */
+	math::Quaternion q_att(_ctrl_state.q[0], _ctrl_state.q[1], _ctrl_state.q[2], _ctrl_state.q[3]);
+	math::Vector<3> eta = q_att.to_euler();
+
+	for (int i = 0; i < 3; i++) {
+		heli_ctrl_U.eta[i] = eta(i);
+	}
+
+	/* attitude setpoint */
+	math::Vector<3> eta_sp(_v_att_sp.roll_body, _v_att_sp.pitch_body, _v_att_sp.yaw_body);
+
+	for (int i = 0; i < 3; i++) {
+		heli_ctrl_U.eta_sp[i] = eta_sp(i);
+	}
+
+	/* current body angular rates */
+	math::Vector<3> rates(_ctrl_state.roll_rate, _ctrl_state.pitch_rate, _ctrl_state.yaw_rate);
+
+	for (int i = 0; i < 3; i++) {
+		heli_ctrl_U.omb[i] = rates(i);
+	}
+
+	/* CONTROLLER PARAMETERS */
+	heli_ctrl_U.ROLLPITCH_PID[0] = _params.att_p.data[0];
+	heli_ctrl_U.RP_RATE_PID[0] =  _params.rate_p.data[0];
+	heli_ctrl_U.RP_RATE_PID[1] =  0; //_params.rate_i.data[0];
+	heli_ctrl_U.RP_RATE_PID[2] =  0; //_params.rate_d.data[0];
+
+	heli_ctrl_U.YAW_PID[0] = _params.att_p.data[2];
+	heli_ctrl_U.YAW_FF = _params.yaw_ff;
+	heli_ctrl_U.YAW_RATE_PID[0] =  _params.rate_p.data[2];
+	heli_ctrl_U.YAW_RATE_PID[1] =  0; //_params.rate_i.data[2];
+	heli_ctrl_U.YAW_RATE_PID[2] =  0; //_params.rate_d.data[2];
+
+	// ------------------ execute MATLAB code ------------------------------
+	heli_ctrl_step((real_T) dt);
+	// ------------------
+
+	/* UPDATE OUTPUT */
+	_thrust_sp = _v_att_sp.thrust;
+
+	for (int i = 0; i < 3; i++) {
+		_rates_sp(i) = heli_ctrl_Y.rate_sp[i];
+	}
+
+	for (int i = 0; i < 3; i++) {
+		_att_control(i) = heli_ctrl_Y.out[i];
+	}
+}
+
+/**
+ * Attitude controller.
+ * Input: 'vehicle_attitude_setpoint' topics (depending on mode)
+ * Output: '_rates_sp' vector, '_thrust_sp'
+ */
+void
+MulticopterAttitudeControl::control_attitude_orig(float dt)
+{
+	//warnx("attitude control!");
+	vehicle_attitude_setpoint_poll();
+
 	_thrust_sp = _v_att_sp.thrust;
 
 	/* construct attitude setpoint rotation matrix */
@@ -714,7 +787,7 @@ MulticopterAttitudeControl::control_attitude(float dt)
 		 * calculate angle and axis for R -> R_sp rotation directly */
 		math::Quaternion q_error;
 		q_error.from_dcm(R.transposed() * R_sp);
-		math::Vector<3> e_R_d = q_error(0) >= 0.0f ? q_error.imag()  * 2.0f: -q_error.imag() * 2.0f;
+		math::Vector<3> e_R_d = q_error(0) >= 0.0f ? q_error.imag()  * 2.0f : -q_error.imag() * 2.0f;
 
 		/* use fusion of Z axis based rotation and direct rotation */
 		float direct_w = e_R_z_cos * e_R_z_cos * yaw_w;
@@ -728,13 +801,15 @@ MulticopterAttitudeControl::control_attitude(float dt)
 	for (int i = 0; i < 3; i++) {
 		if (_v_control_mode.flag_control_velocity_enabled && !_v_control_mode.flag_control_manual_enabled) {
 			_rates_sp(i) = math::constrain(_rates_sp(i), -_params.auto_rate_max(i), _params.auto_rate_max(i));
+
 		} else {
 			_rates_sp(i) = math::constrain(_rates_sp(i), -_params.mc_rate_max(i), _params.mc_rate_max(i));
 		}
 	}
 
 	/* weather-vane mode, dampen yaw rate */
-	if (_v_att_sp.disable_mc_yaw_control == true && _v_control_mode.flag_control_velocity_enabled && !_v_control_mode.flag_control_manual_enabled) {
+	if (_v_att_sp.disable_mc_yaw_control == true && _v_control_mode.flag_control_velocity_enabled
+	    && !_v_control_mode.flag_control_manual_enabled) {
 		float wv_yaw_rate_max = _params.auto_rate_max(2) * _params.vtol_wv_yaw_rate_scale;
 		_rates_sp(2) = math::constrain(_rates_sp(2), -wv_yaw_rate_max, wv_yaw_rate_max);
 		// prevent integrator winding up in weathervane mode
@@ -745,13 +820,15 @@ MulticopterAttitudeControl::control_attitude(float dt)
 	_rates_sp(2) += _v_att_sp.yaw_sp_move_rate * yaw_w * _params.yaw_ff;
 
 	/* weather-vane mode, scale down yaw rate */
-	if (_v_att_sp.disable_mc_yaw_control == true && _v_control_mode.flag_control_velocity_enabled && !_v_control_mode.flag_control_manual_enabled) {
+	if (_v_att_sp.disable_mc_yaw_control == true && _v_control_mode.flag_control_velocity_enabled
+	    && !_v_control_mode.flag_control_manual_enabled) {
 		float wv_yaw_rate_max = _params.auto_rate_max(2) * _params.vtol_wv_yaw_rate_scale;
 		_rates_sp(2) = math::constrain(_rates_sp(2), -wv_yaw_rate_max, wv_yaw_rate_max);
 		// prevent integrator winding up in weathervane mode
 		_rates_int(2) = 0.0f;
 	}
 
+	control_attitude_rates(dt);
 }
 
 /*
@@ -762,6 +839,7 @@ MulticopterAttitudeControl::control_attitude(float dt)
 void
 MulticopterAttitudeControl::control_attitude_rates(float dt)
 {
+	//warnx("attitude rates control!");
 	/* reset integral if disarmed */
 	if (!_armed.armed || !_vehicle_status.is_rotary_wing) {
 		_rates_int.zero();
@@ -827,6 +905,15 @@ MulticopterAttitudeControl::task_main()
 	fds[0].fd = _ctrl_state_sub;
 	fds[0].events = POLLIN;
 
+	//warnx("flag_control_rattitude_enabled: %d", _v_control_mode.flag_control_rattitude_enabled);
+	//warnx("flag_control_attitude_enabled: %d", _v_control_mode.flag_control_attitude_enabled);
+	//warnx("flag_control_manual_enabled: %d", _v_control_mode.flag_control_manual_enabled);
+	//warnx("flag_control_rates_enabled: %d", _v_control_mode.flag_control_rates_enabled);
+
+	// ------------------ execute MATLAB code ------------------------------
+	heli_ctrl_initialize();
+	// ------------------
+
 	while (!_task_should_exit) {
 
 		/* wait for up to 100ms for data */
@@ -861,6 +948,17 @@ MulticopterAttitudeControl::task_main()
 				dt = 0.02f;
 			}
 
+			static int warnx_sent = 0;
+
+			if (hrt_absolute_time() / 1000000.0f > 10.0f && warnx_sent == 0) {
+				warnx_sent = 1;
+				warnx("flags: \t%d\t%d\t%d\t%d",
+				      _v_control_mode.flag_control_rattitude_enabled,
+				      _v_control_mode.flag_control_attitude_enabled,
+				      _v_control_mode.flag_control_manual_enabled,
+				      _v_control_mode.flag_control_rates_enabled);
+			}
+
 			/* copy attitude and control state topics */
 			orb_copy(ORB_ID(control_state), _ctrl_state_sub, &_ctrl_state);
 
@@ -872,125 +970,66 @@ MulticopterAttitudeControl::task_main()
 			vehicle_status_poll();
 			vehicle_motor_limits_poll();
 
-			/* Check if we are in rattitude mode and the pilot is above the threshold on pitch
-			 * or roll (yaw can rotate 360 in normal att control).  If both are true don't
-			 * even bother running the attitude controllers */
-			if (_v_control_mode.flag_control_rattitude_enabled) {
-				if (fabsf(_manual_control_sp.y) > _params.rattitude_thres ||
-				    fabsf(_manual_control_sp.x) > _params.rattitude_thres) {
-					_v_control_mode.flag_control_attitude_enabled = false;
-				}
+			/* ------------ CONTROL ATTITUDE ------------ */
+			//control_attitude_orig(dt);
+			control_attitude(dt);
+
+			/* publish attitude rates setpoint */
+			_v_rates_sp.roll = _rates_sp(0);
+			_v_rates_sp.pitch = _rates_sp(1);
+			_v_rates_sp.yaw = _rates_sp(2);
+			_v_rates_sp.thrust = _thrust_sp;
+			_v_rates_sp.timestamp = hrt_absolute_time();
+
+			if (_v_rates_sp_pub != nullptr) {
+				orb_publish(_rates_sp_id, _v_rates_sp_pub, &_v_rates_sp);
+
+			} else if (_rates_sp_id) {
+				_v_rates_sp_pub = orb_advertise(_rates_sp_id, &_v_rates_sp);
 			}
 
-			if (_v_control_mode.flag_control_attitude_enabled) {
+			//control_attitude_rates(dt);
 
-				if (_ts_opt_recovery == nullptr) {
-					// the  tailsitter recovery instance has not been created, thus, the vehicle
-					// is not a tailsitter, do normal attitude control
-					control_attitude(dt);
+			/* publish actuator controls */
+			_actuators.control[0] = (PX4_ISFINITE(_att_control(0))) ? _att_control(0) : 0.0f;
+			_actuators.control[1] = (PX4_ISFINITE(_att_control(1))) ? _att_control(1) : 0.0f;
+			_actuators.control[2] = (PX4_ISFINITE(_att_control(2))) ? _att_control(2) : 0.0f;
+			_actuators.control[3] = (PX4_ISFINITE(_thrust_sp)) ? _thrust_sp : 0.0f;
+			_actuators.timestamp = hrt_absolute_time();
+			_actuators.timestamp_sample = _ctrl_state.timestamp;
 
-				} else {
-					vehicle_attitude_setpoint_poll();
-					_thrust_sp = _v_att_sp.thrust;
-					math::Quaternion q(_ctrl_state.q[0], _ctrl_state.q[1], _ctrl_state.q[2], _ctrl_state.q[3]);
-					math::Quaternion q_sp(&_v_att_sp.q_d[0]);
-					_ts_opt_recovery->setAttGains(_params.att_p, _params.yaw_ff);
-					_ts_opt_recovery->calcOptimalRates(q, q_sp, _v_att_sp.yaw_sp_move_rate, _rates_sp);
+			_controller_status.roll_rate_integ = _rates_int(0);
+			_controller_status.pitch_rate_integ = _rates_int(1);
+			_controller_status.yaw_rate_integ = _rates_int(2);
+			_controller_status.timestamp = hrt_absolute_time();
 
-					/* limit rates */
-					for (int i = 0; i < 3; i++) {
-						_rates_sp(i) = math::constrain(_rates_sp(i), -_params.mc_rate_max(i), _params.mc_rate_max(i));
-					}
+			if (!_actuators_0_circuit_breaker_enabled) {
+				if (_actuators_0_pub != nullptr) {
+
+					orb_publish(_actuators_id, _actuators_0_pub, &_actuators);
+					perf_end(_controller_latency_perf);
+
+				} else if (_actuators_id) {
+					_actuators_0_pub = orb_advertise(_actuators_id, &_actuators);
 				}
 
-				/* publish attitude rates setpoint */
-				_v_rates_sp.roll = _rates_sp(0);
-				_v_rates_sp.pitch = _rates_sp(1);
-				_v_rates_sp.yaw = _rates_sp(2);
-				_v_rates_sp.thrust = _thrust_sp;
-				_v_rates_sp.timestamp = hrt_absolute_time();
+			}
 
-				if (_v_rates_sp_pub != nullptr) {
-					orb_publish(_rates_sp_id, _v_rates_sp_pub, &_v_rates_sp);
-
-				} else if (_rates_sp_id) {
-					_v_rates_sp_pub = orb_advertise(_rates_sp_id, &_v_rates_sp);
-				}
-
-				//}
+			/* publish controller status */
+			if (_controller_status_pub != nullptr) {
+				orb_publish(ORB_ID(mc_att_ctrl_status), _controller_status_pub, &_controller_status);
 
 			} else {
-				/* attitude controller disabled, poll rates setpoint topic */
-				if (_v_control_mode.flag_control_manual_enabled) {
-					/* manual rates control - ACRO mode */
-					_rates_sp = math::Vector<3>(_manual_control_sp.y, -_manual_control_sp.x,
-								    _manual_control_sp.r).emult(_params.acro_rate_max);
-					_thrust_sp = math::min(_manual_control_sp.z, MANUAL_THROTTLE_MAX_MULTICOPTER);
-
-					/* publish attitude rates setpoint */
-					_v_rates_sp.roll = _rates_sp(0);
-					_v_rates_sp.pitch = _rates_sp(1);
-					_v_rates_sp.yaw = _rates_sp(2);
-					_v_rates_sp.thrust = _thrust_sp;
-					_v_rates_sp.timestamp = hrt_absolute_time();
-
-					if (_v_rates_sp_pub != nullptr) {
-						orb_publish(_rates_sp_id, _v_rates_sp_pub, &_v_rates_sp);
-
-					} else if (_rates_sp_id) {
-						_v_rates_sp_pub = orb_advertise(_rates_sp_id, &_v_rates_sp);
-					}
-
-				} else {
-					/* attitude controller disabled, poll rates setpoint topic */
-					vehicle_rates_setpoint_poll();
-					_rates_sp(0) = _v_rates_sp.roll;
-					_rates_sp(1) = _v_rates_sp.pitch;
-					_rates_sp(2) = _v_rates_sp.yaw;
-					_thrust_sp = _v_rates_sp.thrust;
-				}
-			}
-
-			if (_v_control_mode.flag_control_rates_enabled) {
-				control_attitude_rates(dt);
-
-				/* publish actuator controls */
-				_actuators.control[0] = (PX4_ISFINITE(_att_control(0))) ? _att_control(0) : 0.0f;
-				_actuators.control[1] = (PX4_ISFINITE(_att_control(1))) ? _att_control(1) : 0.0f;
-				_actuators.control[2] = (PX4_ISFINITE(_att_control(2))) ? _att_control(2) : 0.0f;
-				_actuators.control[3] = (PX4_ISFINITE(_thrust_sp)) ? _thrust_sp : 0.0f;
-				_actuators.timestamp = hrt_absolute_time();
-				_actuators.timestamp_sample = _ctrl_state.timestamp;
-
-				_controller_status.roll_rate_integ = _rates_int(0);
-				_controller_status.pitch_rate_integ = _rates_int(1);
-				_controller_status.yaw_rate_integ = _rates_int(2);
-				_controller_status.timestamp = hrt_absolute_time();
-
-				if (!_actuators_0_circuit_breaker_enabled) {
-					if (_actuators_0_pub != nullptr) {
-
-						orb_publish(_actuators_id, _actuators_0_pub, &_actuators);
-						perf_end(_controller_latency_perf);
-
-					} else if (_actuators_id) {
-						_actuators_0_pub = orb_advertise(_actuators_id, &_actuators);
-					}
-
-				}
-
-				/* publish controller status */
-				if (_controller_status_pub != nullptr) {
-					orb_publish(ORB_ID(mc_att_ctrl_status), _controller_status_pub, &_controller_status);
-
-				} else {
-					_controller_status_pub = orb_advertise(ORB_ID(mc_att_ctrl_status), &_controller_status);
-				}
+				_controller_status_pub = orb_advertise(ORB_ID(mc_att_ctrl_status), &_controller_status);
 			}
 		}
 
 		perf_end(_loop_perf);
 	}
+
+	// ------------------ execute MATLAB code ------------------------------
+	heli_ctrl_terminate();
+	// ------------------
 
 	_control_task = -1;
 	return;

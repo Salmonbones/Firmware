@@ -671,11 +671,12 @@ MulticopterAttitudeControl::control_attitude(float dt)
 	}
 
 	/* attitude setpoint */
-	math::Vector<3> eta_sp(_v_att_sp.roll_body, _v_att_sp.pitch_body, _v_att_sp.yaw_body);
+    math::Vector<3> eta_sp(_v_att_sp.roll_body, _v_att_sp.pitch_body, _v_att_sp.yaw_body);
 
-	for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 2; i++) {
 		heli_ctrl_U.eta_sp[i] = eta_sp(i);
 	}
+    heli_ctrl_U.eta_sp[2] = _v_att_sp.yaw_sp_move_rate;//_manual_control_sp.r;
 
 	/* current body angular rates */
 	math::Vector<3> rates(_ctrl_state.roll_rate, _ctrl_state.pitch_rate, _ctrl_state.yaw_rate);
@@ -684,17 +685,33 @@ MulticopterAttitudeControl::control_attitude(float dt)
 		heli_ctrl_U.omb[i] = rates(i);
 	}
 
-	/* CONTROLLER PARAMETERS */
-	heli_ctrl_U.ROLLPITCH_PID[0] = _params.att_p.data[0];
-	heli_ctrl_U.RP_RATE_PID[0] =  _params.rate_p.data[0];
-	heli_ctrl_U.RP_RATE_PID[1] =  0; //_params.rate_i.data[0];
-	heli_ctrl_U.RP_RATE_PID[2] =  0; //_params.rate_d.data[0];
+//    math::Vector<3> att_p;				/**< P gain for angular error */
+//    math::Vector<3> rate_p;				/**< P gain for angular rate error */
+//    math::Vector<3> rate_i;				/**< I gain for angular rate error */
+//    math::Vector<3> rate_d;				/**< D gain for angular rate error */
+//    math::Vector<3>	rate_ff;			/**< Feedforward gain for desired rates */
+//    float yaw_ff;                         /**< yaw control feed-forward */
 
-	heli_ctrl_U.YAW_PID[0] = _params.att_p.data[2];
-	heli_ctrl_U.YAW_FF = _params.yaw_ff;
-	heli_ctrl_U.YAW_RATE_PID[0] =  _params.rate_p.data[2];
-	heli_ctrl_U.YAW_RATE_PID[1] =  0; //_params.rate_i.data[2];
-	heli_ctrl_U.YAW_RATE_PID[2] =  0; //_params.rate_d.data[2];
+    /* ------------------ CONTROLLER PARAMETERS ------------------ */
+    /* --- ATTITUDE CONTROL --- */
+    heli_ctrl_U.ROLLPITCH_FF = 0;                       // roll/pitch FF
+    heli_ctrl_U.ROLLPITCH_PID[0] = _params.att_p(0);    // roll/pitch P     - MC_ROLL_P
+    heli_ctrl_U.ROLLPITCH_PID[1] = 0;                   // roll/pitch I
+    heli_ctrl_U.ROLLPITCH_PID[2] = 0;                   // roll/pitch D
+
+    heli_ctrl_U.YAW_FF = 1;//_params.yaw_ff;                // yaw FF   - MC_YAW_FF
+    heli_ctrl_U.YAW_PID[0] = 0;//_params.att_p(2);          // yaw P    - MC_YAW_P
+    heli_ctrl_U.YAW_PID[1] = 0;                         // yaw I
+    heli_ctrl_U.YAW_PID[2] = 0;                         // yaw D
+
+    /* --- RATE CONTROL --- */
+    heli_ctrl_U.RP_RATE_PID[0] =  _params.rate_p(0);   // P    - MC_ROLLRATE_P
+    heli_ctrl_U.RP_RATE_PID[1] =  _params.rate_i(0);   // I    - MC_ROLLRATE_I
+    heli_ctrl_U.RP_RATE_PID[2] =  _params.rate_d(0);   // D    - MC_ROLLRATE_D
+
+    heli_ctrl_U.YAW_RATE_PID[0] =  _params.rate_p(2);  // P    - MC_YAWRATE_P
+    heli_ctrl_U.YAW_RATE_PID[1] =  _params.rate_i(2);  // I    - MC_YAWRATE_I
+    heli_ctrl_U.YAW_RATE_PID[2] =  _params.rate_d(2);  // D    - MC_YAWRATE_D
 
 	// ------------------ execute MATLAB code ------------------------------
 	heli_ctrl_step((real_T) dt);
@@ -969,6 +986,16 @@ MulticopterAttitudeControl::task_main()
 			vehicle_manual_poll();
 			vehicle_status_poll();
 			vehicle_motor_limits_poll();
+			
+			/* Check if we are in rattitude mode and the pilot is above the threshold on pitch
+			 * or roll (yaw can rotate 360 in normal att control).  If both are true don't
+			 * even bother running the attitude controllers */
+			if (_v_control_mode.flag_control_rattitude_enabled) {
+				if (fabsf(_manual_control_sp.y) > _params.rattitude_thres ||
+				    fabsf(_manual_control_sp.x) > _params.rattitude_thres) {
+					_v_control_mode.flag_control_attitude_enabled = false;
+				}
+			}
 
 			/* ------------ CONTROL ATTITUDE ------------ */
 			//control_attitude_orig(dt);
@@ -998,9 +1025,9 @@ MulticopterAttitudeControl::task_main()
 			_actuators.timestamp = hrt_absolute_time();
 			_actuators.timestamp_sample = _ctrl_state.timestamp;
 
-			_controller_status.roll_rate_integ = _rates_int(0);
-			_controller_status.pitch_rate_integ = _rates_int(1);
-			_controller_status.yaw_rate_integ = _rates_int(2);
+            _controller_status.roll_rate_integ = 0;//_rates_int(0);
+            _controller_status.pitch_rate_integ = 0;//_rates_int(1);
+            _controller_status.yaw_rate_integ = 0;//_rates_int(2);
 			_controller_status.timestamp = hrt_absolute_time();
 
 			if (!_actuators_0_circuit_breaker_enabled) {

@@ -1148,6 +1148,8 @@ int commander_thread_main(int argc, char *argv[])
 
 	bool startup_in_hil = false;
 
+    bool launch_control_running = false;
+
 	// XXX for now just set sensors as initialized
 	status_flags.condition_system_sensors_initialized = true;
 
@@ -1187,6 +1189,7 @@ int commander_thread_main(int argc, char *argv[])
 	param_t _param_geofence_action = param_find("GF_ACTION");
 	param_t _param_disarm_land = param_find("COM_DISARM_LAND");
 	param_t _param_low_bat_act = param_find("COM_LOW_BAT_ACT");
+	param_t _param_launch_en = param_find("COM_LAUNCH_EN");
 
 	param_t _param_fmode_1 = param_find("COM_FLTMODE1");
 	param_t _param_fmode_2 = param_find("COM_FLTMODE2");
@@ -1548,6 +1551,7 @@ int commander_thread_main(int argc, char *argv[])
 
 	int32_t disarm_when_landed = 0;
 	int32_t low_bat_action = 0;
+	int32_t throw_launch_enabled = 0;
 
 	/* check which state machines for changes, clear "changed" flag */
 	bool arming_state_changed = false;
@@ -1629,6 +1633,7 @@ int commander_thread_main(int argc, char *argv[])
 			param_get(_param_geofence_action, &geofence_action);
 			param_get(_param_disarm_land, &disarm_when_landed);
 			param_get(_param_low_bat_act, &low_bat_action);
+			param_get(_param_launch_en, &throw_launch_enabled);
 
 			/* Autostart id */
 			param_get(_param_autostart_id, &autostart_id);
@@ -1956,9 +1961,20 @@ int commander_thread_main(int argc, char *argv[])
 			orb_copy(ORB_ID(vehicle_land_detected), land_detector_sub, &land_detector);
 		}
 
+		/* set lockdown flag */
+        if (throw_launch_enabled){
+            if (!armed.armed && launch_control_running){
+                launch_control_running=false; // reset flag if disarmed
+                armed.lockdown=false;
+            }else if (armed.armed && !launch_control_running && !armed.lockdown) {
+                mavlink_and_console_log_info(&mavlink_log_pub, "Launch mode - Motors are inhibited");
+                armed.lockdown = true;
+            }
+        }
+
 		if ((updated && status_flags.condition_local_altitude_valid) || check_for_disarming) {
-			if (was_landed != land_detector.landed) {
-				if (land_detector.landed && armed.armed) {
+			if (was_landed != land_detector.landed && armed.armed) {
+				if (land_detector.landed) {
 					mavlink_and_console_log_info(&mavlink_log_pub, "LANDING DETECTED");
 				} else {
 					mavlink_and_console_log_info(&mavlink_log_pub, "TAKEOFF DETECTED");
@@ -1968,6 +1984,11 @@ int commander_thread_main(int argc, char *argv[])
 			if (was_falling != land_detector.freefall) {
 				if (land_detector.freefall) {
 					mavlink_and_console_log_info(&mavlink_log_pub, "FREEFALL DETECTED");
+                    if (throw_launch_enabled && armed.armed){
+                        mavlink_and_console_log_info(&mavlink_log_pub, "Running launch control");
+                        launch_control_running=true;
+                        armed.lockdown=false;   //release motors
+                    }
 				}
 			}
 

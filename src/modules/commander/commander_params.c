@@ -277,6 +277,21 @@ PARAM_DEFINE_INT32(COM_DISARM_LAND, 0);
 PARAM_DEFINE_INT32(COM_LOW_BAT_ACT, 0);
 
 /**
+ * Throw launch mode
+ *
+ * Enable throw/free-fall launch mode. Defaults to off (0)
+ *
+ * @group Commander
+ * @value 0 Disable
+ * @value 1 Enable
+ * @min 0
+ * @max 1
+ * @decimal 0
+ * @increment 1
+ */
+PARAM_DEFINE_INT32(COM_LAUNCH_EN, 0);
+
+/**
  * First flightmode slot (1000-1160)
  *
  * If the main switch channel is in this range the
